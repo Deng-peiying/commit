@@ -1,10 +1,10 @@
-# Generalist Bimanual Manipulation via Foundation Video Diffusion Models
+# Vidar: Embodied Video Diffusion Model for Generalist Bimanual Manipulation
 
 ### 📝[Paper](https://arxiv.org/abs/2507.12898) | 🌍[Project Page](https://embodiedfoundation.github.io/vidar_anypos)
 
 ## Introduction
 
-Here is the codebase for **Generalist Bimanual Manipulation via Foundation Video Diffusion Models**.
+Here is the codebase for **Vidar: Embodied Video Diffusion Model for Generalist Bimanual Manipulation**.
 
 Below you will find setup instructions and basic usage guidance for the code within the `vidar` folder.
 
