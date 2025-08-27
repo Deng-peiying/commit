@@ -1,6 +1,6 @@
 # Vidar: Embodied Video Diffusion Model for Generalist Bimanual Manipulation
 
-### 📝[Paper](https://arxiv.org/abs/2507.12898) | 🌍[Project Page](https://embodiedfoundation.github.io/vidar_anypos)
+### 📝[Paper](https://arxiv.org/abs/2507.12898) | 🌍[Project Page](https://embodiedfoundation.github.io/vidar_anypos) | [Pre-trained HunyuanVideo Checkpoint](https://huggingface.co/yaofeng1998/Vidar-Pretrain-10000steps)
 
 ## Introduction
 
