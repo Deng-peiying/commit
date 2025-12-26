@@ -2,6 +2,8 @@
 
 ### 📝[Paper](https://arxiv.org/abs/2507.12898) | 🌍[Project Page](https://embodiedfoundation.github.io/vidar_anypos) | [Pre-trained HunyuanVideo Checkpoint](https://huggingface.co/yaofeng1998/Vidar-Pretrain-10000steps)
 
+Also refer to [here](https://github.com/thu-ml/vidar) for the latest version with the Wan 2.2 model.
+
 ## Introduction
 
 Here is the codebase for **Vidar: Embodied Video Diffusion Model for Generalist Bimanual Manipulation**.
