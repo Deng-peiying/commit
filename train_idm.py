@@ -14,47 +14,55 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from idm.cache_dataset import CacheDataSet
-from idm.idm import *
+from idm.idm import IDM, OUTPUT_DIM
 from idm.preprocessor import DinoPreprocessor
 from idm.utils import seed_torch
 
+# Tolerance per joint dimension used for "close enough" accuracy metric.
+# Layout: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+_CLOSE_LIMIT = torch.tensor([
+    0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,   # left arm
+    0.05,                                          # left gripper
+    0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,   # right arm
+    0.05,                                          # right gripper
+])
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train IDM")
-    parser.add_argument("--load_from", type=str, default=None, help="Load from path")
-    parser.add_argument("--wandb_mode", type=str, default="online", help="Wandb mode")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--mask_weight", type=float, default=1e-3, help="Mask weight")
-    parser.add_argument("--use_transform", action="store_true", default=False, help="Use transform")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per GPU")
-    parser.add_argument("--eval_batch_size", type=int, default=32, help="Batch size per GPU")
-    parser.add_argument("--num_workers", type=int, default=16, help="Number of data loading workers")
-    parser.add_argument("--prefetch_factor", type=int, default=4, help="Number of batches to prefetch")
-    parser.add_argument("--dataset_path", type=str, default="", help="Path of the dataset")
-    parser.add_argument("--num_iterations", type=int, default=150000, help="Number of iterations")
-    parser.add_argument("--eval_interval", type=int, default=2000, help="Intervals of evaluation. ")
-    parser.add_argument("--run_name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), help="Run name")
-    parser.add_argument("--save_dir", type=str, default="output", help="Save dir")
-    parser.add_argument("--ratio_eval", type=float, default=0.05, help="Ratio of data for validation, but eval_dataset_size is at most 10000")
-    parser.add_argument("--model_name", type=str, default="mask", help="Choose a suitable model.")
-    parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "cosine"], help="Learning rate scheduler type")
-    parser.add_argument("--test_dataset_path", nargs="+", default=[], help="Path of the test dataset")
-    parser.add_argument("--eval_only", action="store_true", default=False, help="Only run evaluation on val and test sets")
-    parser.add_argument("--use_normalization", action="store_true", default=False, help="Use mean/std normalization")
-    parser.add_argument("--load_mp4", action="store_true", default=True, help="load the data in mp4 format to save memory")
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="Train IDM (dual-frame, delta prediction)")
+    parser.add_argument("--load_from", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online")
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--mask_weight", type=float, default=1e-2, help="Mask density regularisation weight")
+    parser.add_argument("--use_transform", action="store_true", default=False)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--eval_batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--dataset_path", type=str, default="")
+    parser.add_argument("--num_iterations", type=int, default=150000)
+    parser.add_argument("--eval_interval", type=int, default=2000)
+    parser.add_argument("--run_name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    parser.add_argument("--save_dir", type=str, default="output")
+    parser.add_argument("--ratio_eval", type=float, default=0.05)
+    parser.add_argument("--model_name", type=str, default="mask")
+    parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--test_dataset_path", nargs="+", default=[])
+    parser.add_argument("--eval_only", action="store_true", default=False)
+    return parser.parse_args()
 
 
 def collate_fn(batch):
-    # batch is a list of tuples (pos, image), pos is [B, 14], image is [B, 3, 518, 518] tensor
-    # image is a pil image: [H, W, C]
-    # concatenate all pos and images from list to tensor
-    images, pos = zip(*batch)
-    # preprocess images
-    images = torch.stack(images)
-    pos = torch.stack(pos)  # [B, 14]
-    return images, pos
+    """batch: list of (img_t, dep_t, img_next, dep_next, pos_t, pos_next)"""
+    img_t, dep_t, img_next, dep_next, pos_t, pos_next = zip(*batch)
+    return (
+        torch.stack(img_t),     # [B, 3, H, W]
+        torch.stack(dep_t),     # [B, 1, H, W]
+        torch.stack(img_next),  # [B, 3, H, W]
+        torch.stack(dep_next),  # [B, 1, H, W]
+        torch.stack(pos_t),     # [B, 16]
+        torch.stack(pos_next),  # [B, 16]
+    )
 
 
 def get_data_generator(dataloader):
@@ -63,130 +71,107 @@ def get_data_generator(dataloader):
             yield data
 
 
-def save_model(accelerator: Accelerator, net: torch.nn.Module, optimizer: torch.optim.Optimizer, step, save_path):
+def save_model(accelerator, net, optimizer, step, save_path):
     accelerator.wait_for_everyone()
-    save_dir = os.path.dirname(save_path)
     if accelerator.is_main_process:
-        try:
-            os.makedirs(save_dir, exist_ok=True)
-            if not os.access(save_dir, os.W_OK):
-                print(f"Warning: No write permission for directory {save_dir}")
-                return
-
-            state_dict = {
-                "model_state_dict": accelerator.unwrap_model(net).state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "step": step
-            }
-            torch.save(state_dict, save_path)
-        except Exception as e:
-            print(f"Error saving model: {str(e)}")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({
+            "model_state_dict": accelerator.unwrap_model(net).state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": step,
+        }, save_path)
     accelerator.wait_for_everyone()
 
 
-def is_close(pos, output):
-    limit = torch.tensor([0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]).to(pos.device)
-    # gripper:
-    limit[6] = 0.5
-    limit[13] = 0.5
-    # Handle both single samples and batches
-    if pos.dim() == 1:
-        return torch.all(torch.abs(pos - output) < limit)
-    else:
-        return torch.all(torch.abs(pos - output) < limit, dim=1)
+def is_close(delta_true, delta_pred, device):
+    """Check per-sample whether predicted delta is within tolerance."""
+    limit = _CLOSE_LIMIT.to(device)
+    if delta_true.dim() == 1:
+        return torch.all(torch.abs(delta_true - delta_pred) < limit)
+    return torch.all(torch.abs(delta_true - delta_pred) < limit, dim=1)
 
 
-def eval(accelerator: Accelerator, net: torch.nn.Module, dataloader: DataLoader, loss_fn, step, use_normalization, mode='val', save_dir='output'):
+def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='output'):
     os.makedirs(save_dir, exist_ok=True)
     accelerator.wait_for_everyone()
     net.eval()
     first_batch = True
+
     with torch.no_grad():
-        eval_loss = 0
-        eval_l1_error = 0
+        eval_loss = 0.0
+        eval_l1_error = 0.0
         total_correct = 0
         total_samples = 0
 
-        # Get learning dimensions mask from loss function
-        learning_mask = loss_fn.learning_mask.to(accelerator.device) if hasattr(loss_fn, 'learning_mask') else torch.ones(14, dtype=torch.bool).to(accelerator.device)
-        active_dims = learning_mask.sum().item()
-        
-        for images, pos in tqdm(dataloader, disable=not accelerator.is_main_process):
-            pos = accelerator.gather(pos)
-            output = net(images, return_mask=True)
-            if isinstance(output, tuple):
-                output, mask = output
-                output = accelerator.gather(output)
-                mask = accelerator.gather(mask)
+        for img_t, dep_t, img_next, dep_next, pos_t, pos_next in tqdm(dataloader, disable=not accelerator.is_main_process):
+            delta_label = pos_next - pos_t           # [B, 16]
+
+            result = net(img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
+            if isinstance(result, tuple):
+                delta_pred, mask = result
             else:
-                output = accelerator.gather(output)
-                mask = None
+                delta_pred, mask = result, None
+
+            delta_label = accelerator.gather(delta_label)
+            delta_pred  = accelerator.gather(delta_pred)
+            pos_t_g     = accelerator.gather(pos_t)
 
             if accelerator.is_main_process:
-                # Only compute metrics for learned dimensions
-                masked_abs_error = torch.abs(pos - output) * learning_mask.float()
-                eval_l1_error += (masked_abs_error.sum(dim=1) / active_dims).sum().item() if active_dims > 0 else 0
-                
-                # For is_close calculation, we only check dimensions we're learning
-                if active_dims > 0:
-                    is_close_mask = torch.abs(pos - output) < torch.tensor([0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.5, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.5]).to(pos.device)
-                    # A sample is correct only if all learned dimensions are close
-                    correct_samples = is_close_mask[:, learning_mask].float()
-                    correct_samples = torch.all(correct_samples, dim=1)
-                    total_correct += correct_samples.sum().item()
+                B = delta_label.shape[0]
+                total_samples += B
 
-                total_samples += len(pos)
-                
+                l1 = torch.abs(delta_label - delta_pred).mean(dim=1)
+                eval_l1_error += l1.sum().item()
+
+                close = is_close(delta_label, delta_pred, delta_label.device)
+                total_correct += close.sum().item()
+
+                loss = loss_fn(delta_pred, delta_label)
+                eval_loss += loss.item() * B
+
                 if first_batch:
-                    sample_image = images[0].detach().cpu().numpy()
-                    sample_image = np.transpose(sample_image, (1, 2, 0))
-                    sample_image *= np.array([0.229, 0.224, 0.225])
-                    sample_image += np.array([0.485, 0.456, 0.406])
-                    sample_image = np.clip(sample_image, 0, 1)
-                    sample_image = (sample_image * 255).astype(np.uint8)[:, :, [2, 1, 0]]
-                    cv2.imwrite(os.path.join(save_dir, f'image_{mode}_{step}.png'), sample_image)
+                    # Save sample RGB frame (t frame, first 3 channels)
+                    sample_rgb = img_t[0].detach().cpu().numpy()          # [3, H, W]
+                    sample_rgb = np.transpose(sample_rgb, (1, 2, 0))
+                    sample_rgb = sample_rgb * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                    sample_rgb = np.clip(sample_rgb * 255, 0, 255).astype(np.uint8)[:, :, ::-1]
+                    cv2.imwrite(os.path.join(save_dir, f'image_{mode}_{step}.png'), sample_rgb)
 
                     if mask is not None:
-                        sample_mask = mask[0].detach().cpu().numpy()
+                        mask_g = accelerator.gather(mask)
+                        sample_mask = mask_g[0].detach().cpu().numpy()    # [1, H, W]
                         sample_mask = np.transpose(sample_mask, (1, 2, 0))
-                        sample_mask = np.where(sample_mask >= 0.5, sample_image, 255).astype(np.uint8)
-                        cv2.imwrite(os.path.join(save_dir, f'mask_{mode}_{step}.png'), sample_mask)
+                        sample_mask_vis = np.where(sample_mask >= 0.5, sample_rgb, 255).astype(np.uint8)
+                        cv2.imwrite(os.path.join(save_dir, f'mask_{mode}_{step}.png'), sample_mask_vis)
 
-                    sample_pos = pos[0].detach().cpu().numpy()
-                    sample_output = output[0].detach().cpu().numpy()
-                    is_correct = is_close(pos[0], output[0]).item()
+                    fmt = lambda v: ', '.join(f'{x:.4f}' for x in v)
+                    pos_t_0       = pos_t_g[0].cpu()
+                    pos_next_0    = (pos_t_g[0] + delta_label[0]).cpu()   # ground-truth pos_{t+1}
+                    pos_pred_0    = (pos_t_g[0] + delta_pred[0]).cpu()    # predicted pos_{t+1}
+                    joint_err     = (pos_pred_0 - pos_next_0).abs()       # per-joint absolute error
 
-                    formatted_pos = ', '.join([f"{val:.4f}" for val in sample_pos])
-                    formatted_output = ', '.join([f"{val:.4f}" for val in sample_output])
-                    
-                    print(f"\nSample pos: [{formatted_pos}]")
-                    print(f"Sample output: [{formatted_output}]")
-                    print(f"Correct?: {is_correct}")
+                    print(f"\ndelta_label[0]: [{fmt(delta_label[0].cpu())}]")
+                    print(f"delta_pred [0]: [{fmt(delta_pred[0].cpu())}]")
+                    print(f"pos_t      [0]: [{fmt(pos_t_0)}]")
+                    print(f"pos_next   [0]: [{fmt(pos_next_0)}]")
+                    print(f"pos_pred   [0]: [{fmt(pos_pred_0)}]")
+                    print(f"joint_err  [0]: [{fmt(joint_err)}]  mean={joint_err.mean():.4f}  max={joint_err.max():.4f}")
+                    print(f"Correct?  {close[0].item()}")
                     first_batch = False
-                
-                # For loss calculation, normalize pos if normalization is used
-                if use_normalization:
-                    loss = loss_fn(net.normalize(output), net.normalize(pos))
-                else:
-                    loss = loss_fn(output, pos)
-                eval_loss += loss.item() * len(pos)
 
         if accelerator.is_main_process:
-            eval_loss /= total_samples
-            eval_l1_error /= total_samples
-            correct_rate = total_correct / total_samples if total_samples > 0 else 0.0
-            
-            # Print results instead of logging to wandb in eval-only mode
-            print(f"{mode}_loss: {eval_loss:.4f}, {mode}_l1_error: {eval_l1_error:.4f}, correct_rate: {correct_rate:.4f}")
-            
-            # Only log to wandb if it's initialized
+            eval_loss      /= total_samples
+            eval_l1_error  /= total_samples
+            correct_rate    = total_correct / total_samples
+
+            print(f"{mode} loss={eval_loss:.4f}  l1={eval_l1_error:.4f}  acc={correct_rate:.4f}")
             if wandb.run is not None:
                 wandb.log({
-                    f"{mode}_loss": eval_loss, 
-                    f"{mode}_l1_error": eval_l1_error, 
-                    f"{mode}_correct_rate": correct_rate
+                    f"{mode}_loss": eval_loss,
+                    f"{mode}_l1_error": eval_l1_error,
+                    f"{mode}_correct_rate": correct_rate,
                 }, step=step)
-    
+
     net.train()
     accelerator.wait_for_everyone()
 
@@ -194,150 +179,163 @@ def eval(accelerator: Accelerator, net: torch.nn.Module, dataloader: DataLoader,
 def main(args):
     seed_torch(1234)
     accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
-    num_gpus = torch.cuda.device_count()
+    num_gpus = max(torch.cuda.device_count(), 1)
     save_dir = os.path.join(args.save_dir, args.run_name)
-    
-    # Initialize wandb only if not in eval mode
+
     if accelerator.is_main_process and not args.eval_only:
         os.makedirs(save_dir, exist_ok=True)
-        wandb.init(project=f"IDM_{args.model_name}", mode=args.wandb_mode, config=args.__dict__, name=args.run_name)
-    
-    if accelerator.is_main_process:
-        print(f"{args.__dict__}")
+        wandb.init(project=f"IDM_{args.model_name}", mode=args.wandb_mode,
+                   config=args.__dict__, name=args.run_name)
 
-    # Initialize preprocessor
+    if accelerator.is_main_process:
+        print(args.__dict__)
+
     preprocessor = DinoPreprocessor(args)
-    
-    # load dataset
-    dataset = CacheDataSet(args, dataset_path=args.dataset_path, disable_pbar=not accelerator.is_main_process, preprocessor=preprocessor)
-    test_dataset = [CacheDataSet(args, dataset_path=item, disable_pbar=not accelerator.is_main_process, type="test", preprocessor=preprocessor) for item in args.test_dataset_path]
-    dataset_size = len(dataset)
-    val_dataset_size = min(int(args.ratio_eval * dataset_size), 10000)
-    train_dataset_size = dataset_size - val_dataset_size
-    train_dataset, val_dataset = random_split(dataset, [train_dataset_size, val_dataset_size])
+
+    dataset = CacheDataSet(args, dataset_path=args.dataset_path,
+                           disable_pbar=not accelerator.is_main_process,
+                           preprocessor=preprocessor)
+    test_datasets = [
+        CacheDataSet(args, dataset_path=p,
+                     disable_pbar=not accelerator.is_main_process,
+                     type="test", preprocessor=preprocessor)
+        for p in args.test_dataset_path
+    ]
+
+    dataset_size     = len(dataset)
+    val_size         = min(int(args.ratio_eval * dataset_size), 10000)
+    train_size       = dataset_size - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
     if accelerator.is_main_process:
-        print('train_dataset_size', train_dataset_size, 'val_dataset_size', val_dataset_size, 'test_dataset_size', len(test_dataset))
-    
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                  num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=True, prefetch_factor=args.prefetch_factor)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False,
-                                num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=False, prefetch_factor=args.prefetch_factor)
-    test_dataloader = [DataLoader(item, batch_size=args.eval_batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=False, prefetch_factor=args.prefetch_factor) for item in test_dataset]
+        print(f"train={train_size}  val={val_size}  test={[len(d) for d in test_datasets]}")
 
-    net = IDM(model_name=args.model_name, output_dim=14)
+    dl_kwargs = dict(num_workers=args.num_workers, pin_memory=True,
+                     collate_fn=collate_fn, prefetch_factor=args.prefetch_factor)
+    train_dataloader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, **dl_kwargs)
+    val_dataloader   = DataLoader(val_ds,   batch_size=args.eval_batch_size, shuffle=False, drop_last=False, **dl_kwargs)
+    test_dataloaders = [DataLoader(d, batch_size=args.eval_batch_size, shuffle=False, drop_last=False, **dl_kwargs) for d in test_datasets]
 
-    optimizer = AdamW(net.parameters())
-    net.train()
+    net = IDM(model_name=args.model_name, output_dim=OUTPUT_DIM)
+    optimizer = AdamW(net.parameters(), lr=args.learning_rate)
+
+    # Compute per-joint delta std from training set for normalised motion weighting
+    if accelerator.is_main_process:
+        print("Computing delta_std from training set...")
+    all_deltas = []
+    for ep_idx in range(len(dataset.rgb_frames)):
+        qpos = dataset.qpos_data[ep_idx]            # [T, 16]
+        all_deltas.append(qpos[1:] - qpos[:-1])    # [T-1, 16]
+    all_deltas = torch.cat(all_deltas, dim=0)       # [N, 16]
+    delta_std = all_deltas.std(dim=0).clamp(min=1e-4)  # [16]
+    if accelerator.is_main_process:
+        print(f"delta_std: {[f'{v:.4f}' for v in delta_std.tolist()]}")
     loss_fn = nn.SmoothL1Loss()
 
-    # Setup learning rate scheduler
+    # Cosine LR with linear warmup
     if args.lr_scheduler == "cosine":
-        warmup_steps = int(0.1 * args.num_iterations)  # 10% of total steps for warmup
+        warmup_steps = int(0.1 * args.num_iterations)
         def lr_lambda(step):
             step = step // num_gpus
-            eta_min = 1e-9
             if step < warmup_steps:
-                # Linear warmup
-                return eta_min + float(step) / float(max(1, warmup_steps))
-
-            progress = float(step - warmup_steps) / float(max(1, args.num_iterations - warmup_steps))
+                return float(step) / max(1, warmup_steps)
+            progress = float(step - warmup_steps) / max(1, args.num_iterations - warmup_steps)
             return 0.5 * (np.cos(progress * np.pi) + 1)
-
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        if accelerator.is_main_process:
-            print(f"Using cosine scheduler with {warmup_steps} warmup steps")
-        if accelerator.is_main_process:
-            print(f"Using cosine decay scheduler with {warmup_steps} warmup steps")
     else:
         scheduler = None
 
-    if not args.load_from or not os.path.isfile(args.load_from):
-        if args.eval_only:
-            raise ValueError("Must specify --load_from with a valid model path when using --eval_only")
-        start_step = 0
-    else:
-        try:
-            loaded_dict = torch.load(args.load_from)
-            net.load_state_dict(loaded_dict["model_state_dict"])
-            if not args.eval_only:
-                optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-                start_step = loaded_dict["step"]
-                if scheduler is not None:
-                    for _ in range(start_step):
-                        scheduler.step()
-            if accelerator.is_main_process:
-                print(f"Loaded model from {args.load_from}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load checkpoint from {args.load_from}: {str(e)}")
+    start_step = 0
+    if args.load_from and os.path.isfile(args.load_from):
+        ckpt = torch.load(args.load_from, map_location='cpu')
+        net.load_state_dict(ckpt["model_state_dict"])
+        if not args.eval_only:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_step = ckpt["step"]
+            if scheduler is not None:
+                for _ in range(start_step):
+                    scheduler.step()
+        if accelerator.is_main_process:
+            print(f"Loaded checkpoint from {args.load_from} (step {start_step})")
+    elif args.eval_only:
+        raise ValueError("--eval_only requires --load_from")
 
     net, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
         net, optimizer, train_dataloader, val_dataloader)
-    test_dataloader = [accelerator.prepare(dataloader) for dataloader in test_dataloader]
-    net.normalize = accelerator.unwrap_model(net).normalize
+    test_dataloaders = [accelerator.prepare(dl) for dl in test_dataloaders]
     if scheduler is not None:
         scheduler = accelerator.prepare(scheduler)
 
     if args.eval_only:
         preprocessor.use_transform = False
-        eval(accelerator, net, val_dataloader, loss_fn, 0, args.use_normalization, mode='val', save_dir=save_dir)
-        for i in range(len(test_dataloader)):
-            eval(accelerator, net, test_dataloader[i], loss_fn, 0, args.use_normalization, mode=f'test{i}', save_dir=save_dir)
-        preprocessor.use_transform = args.use_transform
+        eval(accelerator, net, val_dataloader, loss_fn, 0, mode='val', save_dir=save_dir)
+        for i, dl in enumerate(test_dataloaders):
+            eval(accelerator, net, dl, loss_fn, 0, mode=f'test{i}', save_dir=save_dir)
         return
 
-    train_data_generator = get_data_generator(train_dataloader)
+    net.train()
+    train_gen = get_data_generator(train_dataloader)
 
     pbar = tqdm(range(start_step, args.num_iterations), disable=not accelerator.is_main_process)
-    for step in pbar: 
-        images, pos = next(train_data_generator)
-        output = net(images, return_mask=True)
-        if isinstance(output, tuple):
-            output, mask = output
-        else:
-            mask = None
+    for step in pbar:
+        img_t, dep_t, img_next, dep_next, pos_t, pos_next = next(train_gen)
 
-        # Calculate batch accuracy using denormalized values
-        batch_correct = is_close(pos, output)
-        batch_accuracy = batch_correct.float().mean().item()
+        # Ground-truth: increment only, pos_{t+1} never enters the model
+        delta_label = pos_next - pos_t   # [B, 16]
 
-        if args.use_normalization:
-            loss = loss_fn(net.normalize(output), net.normalize(pos))
+        result = net(img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
+        if isinstance(result, tuple):
+            delta_pred, mask = result
         else:
-            loss = loss_fn(output, pos)
+            delta_pred, mask = result, None
+
+        # Normalise delta by per-joint std before computing motion magnitude.
+        # This makes arm joints and gripper joints contribute equally to the weight.
+        with torch.no_grad():
+            delta_std_dev = delta_std.to(delta_label.device)                             # [16]
+            delta_normed  = delta_label / delta_std_dev                                  # [B, 16]
+            motion_weight = delta_normed.abs().mean(dim=1, keepdim=True)                 # [B, 1]
+            motion_weight = (motion_weight / (motion_weight.mean() + 1e-8)).clamp(0.2, 5.0)
+
+        per_sample_loss = torch.nn.functional.smooth_l1_loss(delta_pred, delta_label, reduction='none').mean(dim=1, keepdim=True)
+        loss = (per_sample_loss * motion_weight).mean()
+        mask_loss = torch.tensor(0.0, device=loss.device)
         if mask is not None:
-            mask_loss = args.mask_weight * mask.mean()
-            loss += mask_loss
-        else:
-            mask_loss = torch.tensor(0.0, device=loss.device)
+            # Bidirectional penalty: keep mask density near target (0.3)
+            # prevents both collapse-to-zero and spread-to-all
+            target_density = 0.3
+            mask_loss = args.mask_weight * (mask.mean() - target_density).pow(2)
+            loss = loss + mask_loss
+
         optimizer.zero_grad()
         accelerator.backward(loss)
+        torch.nn.utils.clip_grad_norm_(accelerator.unwrap_model(net).parameters(), max_norm=1.0)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
         if accelerator.is_main_process:
-            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
-            pbar.set_postfix(loss=f"{loss.item():.2e}", mask_loss=f"{mask_loss.item():.2e}", lr=f"{current_lr:.2e}", batch_acc=f"{batch_accuracy:.4f}")
+            batch_acc = is_close(delta_label, delta_pred, delta_label.device).float().mean().item()
+            lr_now = scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{loss.item():.2e}", mask=f"{mask_loss.item():.2e}",
+                             lr=f"{lr_now:.2e}", acc=f"{batch_acc:.3f}")
             if step % 10 == 0:
                 wandb.log({
                     "loss": loss.item(),
                     "mask_loss": mask_loss.item(),
-                    "learning_rate": current_lr,
-                    "batch_accuracy": batch_accuracy
+                    "learning_rate": lr_now,
+                    "batch_accuracy": batch_acc,
                 }, step=step)
 
         if (step + 1) % args.eval_interval == 0:
-            try:
-                preprocessor.use_transform = False
-                eval(accelerator, net, val_dataloader, loss_fn, step, args.use_normalization, mode='val', save_dir=save_dir)
-                for i in range(len(test_dataloader)):
-                    eval(accelerator, net, test_dataloader[i], loss_fn, step, args.use_normalization, mode=f'test{i}', save_dir=save_dir)
-                preprocessor.use_transform = args.use_transform
-            except Exception as e:
-                print(f"Error during evaluation at step {step}: {str(e)}")
+            preprocessor.use_transform = False
+            eval(accelerator, net, val_dataloader, loss_fn, step + 1, mode='val', save_dir=save_dir)
+            for i, dl in enumerate(test_dataloaders):
+                eval(accelerator, net, dl, loss_fn, step + 1, mode=f'test{i}', save_dir=save_dir)
+            preprocessor.use_transform = args.use_transform
+            save_model(accelerator, net, optimizer, step + 1,
+                       os.path.join(save_dir, f"{step + 1}.pt"))
 
-            save_model(accelerator, net, optimizer, step + 1, os.path.join(save_dir, f"{step + 1}.pt"))
     if accelerator.is_main_process:
         wandb.finish()
 
