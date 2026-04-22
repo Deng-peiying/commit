@@ -22,7 +22,7 @@ class DinoPreprocessor:
         self.current_progress = 0.0
         self.height = 720
         self.width = 640
-        self.dino_size = 224
+        self.dino_size = 518
         self._build_transforms()
 
     def _lerp(self, start, end, progress):

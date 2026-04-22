@@ -19,21 +19,21 @@ from idm.preprocessor import DinoPreprocessor
 from idm.utils import seed_torch
 
 # Tolerance per joint dimension used for "close enough" accuracy metric.
+# From paper: max infinity norm error < 0.06 for joints, < 0.6 for grippers.
 # Layout: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
 _CLOSE_LIMIT = torch.tensor([
-    0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,   # left arm
-    0.05,                                          # left gripper
-    0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,   # right arm
-    0.05,                                          # right gripper
+    0.06, 0.06, 0.06, 0.06, 0.06, 0.06, 0.06,   # left arm
+    0.6,                                           # left gripper
+    0.06, 0.06, 0.06, 0.06, 0.06, 0.06, 0.06,   # right arm
+    0.6,                                           # right gripper
 ])
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train IDM (dual-frame, delta prediction)")
+    parser = argparse.ArgumentParser(description="Train IDM (dual-frame, predict pos_{t+1})")
     parser.add_argument("--load_from", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="online")
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--mask_weight", type=float, default=1e-2, help="Mask density regularisation weight")
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--use_transform", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--eval_batch_size", type=int, default=32)
@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--test_dataset_path", nargs="+", default=[])
     parser.add_argument("--eval_only", action="store_true", default=False)
+    parser.add_argument("--test_only", action="store_true", default=False, help="Only run test eval, skip train/val loading")
     return parser.parse_args()
 
 
@@ -83,12 +84,12 @@ def save_model(accelerator, net, optimizer, step, save_path):
     accelerator.wait_for_everyone()
 
 
-def is_close(delta_true, delta_pred, device):
-    """Check per-sample whether predicted delta is within tolerance."""
+def is_close(pos_true, pos_pred, device):
+    """Check per-sample whether predicted pos is within tolerance of ground truth."""
     limit = _CLOSE_LIMIT.to(device)
-    if delta_true.dim() == 1:
-        return torch.all(torch.abs(delta_true - delta_pred) < limit)
-    return torch.all(torch.abs(delta_true - delta_pred) < limit, dim=1)
+    if pos_true.dim() == 1:
+        return torch.all(torch.abs(pos_true - pos_pred) < limit)
+    return torch.all(torch.abs(pos_true - pos_pred) < limit, dim=1)
 
 
 def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='output'):
@@ -104,57 +105,39 @@ def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='outp
         total_samples = 0
 
         for img_t, dep_t, img_next, dep_next, pos_t, pos_next in tqdm(dataloader, disable=not accelerator.is_main_process):
-            delta_label = pos_next - pos_t           # [B, 16]
+            pos_pred = net(img_t, dep_t, img_next, dep_next, pos_t)
 
-            result = net(img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
-            if isinstance(result, tuple):
-                delta_pred, mask = result
-            else:
-                delta_pred, mask = result, None
-
-            delta_label = accelerator.gather(delta_label)
-            delta_pred  = accelerator.gather(delta_pred)
-            pos_t_g     = accelerator.gather(pos_t)
+            pos_next_g = accelerator.gather(pos_next)
+            pos_pred_g = accelerator.gather(pos_pred)
+            pos_t_g    = accelerator.gather(pos_t)
 
             if accelerator.is_main_process:
-                B = delta_label.shape[0]
+                B = pos_next_g.shape[0]
                 total_samples += B
 
-                l1 = torch.abs(delta_label - delta_pred).mean(dim=1)
+                l1 = torch.abs(pos_next_g - pos_pred_g).mean(dim=1)
                 eval_l1_error += l1.sum().item()
 
-                close = is_close(delta_label, delta_pred, delta_label.device)
+                close = is_close(pos_next_g, pos_pred_g, pos_next_g.device)
                 total_correct += close.sum().item()
 
-                loss = loss_fn(delta_pred, delta_label)
+                loss = loss_fn(pos_pred_g, pos_next_g)
                 eval_loss += loss.item() * B
 
                 if first_batch:
-                    # Save sample RGB frame (t frame, first 3 channels)
-                    sample_rgb = img_t[0].detach().cpu().numpy()          # [3, H, W]
+                    # Save sample RGB frame
+                    sample_rgb = img_t[0].detach().cpu().numpy()
                     sample_rgb = np.transpose(sample_rgb, (1, 2, 0))
                     sample_rgb = sample_rgb * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
                     sample_rgb = np.clip(sample_rgb * 255, 0, 255).astype(np.uint8)[:, :, ::-1]
                     cv2.imwrite(os.path.join(save_dir, f'image_{mode}_{step}.png'), sample_rgb)
 
-                    if mask is not None:
-                        mask_g = accelerator.gather(mask)
-                        sample_mask = mask_g[0].detach().cpu().numpy()    # [1, H, W]
-                        sample_mask = np.transpose(sample_mask, (1, 2, 0))
-                        sample_mask_vis = np.where(sample_mask >= 0.5, sample_rgb, 255).astype(np.uint8)
-                        cv2.imwrite(os.path.join(save_dir, f'mask_{mode}_{step}.png'), sample_mask_vis)
-
                     fmt = lambda v: ', '.join(f'{x:.4f}' for x in v)
-                    pos_t_0       = pos_t_g[0].cpu()
-                    pos_next_0    = (pos_t_g[0] + delta_label[0]).cpu()   # ground-truth pos_{t+1}
-                    pos_pred_0    = (pos_t_g[0] + delta_pred[0]).cpu()    # predicted pos_{t+1}
-                    joint_err     = (pos_pred_0 - pos_next_0).abs()       # per-joint absolute error
+                    joint_err = (pos_pred_g[0] - pos_next_g[0]).abs().cpu()
 
-                    print(f"\ndelta_label[0]: [{fmt(delta_label[0].cpu())}]")
-                    print(f"delta_pred [0]: [{fmt(delta_pred[0].cpu())}]")
-                    print(f"pos_t      [0]: [{fmt(pos_t_0)}]")
-                    print(f"pos_next   [0]: [{fmt(pos_next_0)}]")
-                    print(f"pos_pred   [0]: [{fmt(pos_pred_0)}]")
+                    print(f"\npos_t      [0]: [{fmt(pos_t_g[0].cpu())}]")
+                    print(f"pos_next   [0]: [{fmt(pos_next_g[0].cpu())}]")
+                    print(f"pos_pred   [0]: [{fmt(pos_pred_g[0].cpu())}]")
                     print(f"joint_err  [0]: [{fmt(joint_err)}]  mean={joint_err.mean():.4f}  max={joint_err.max():.4f}")
                     print(f"Correct?  {close[0].item()}")
                     first_batch = False
@@ -192,6 +175,39 @@ def main(args):
 
     preprocessor = DinoPreprocessor(args)
 
+    # --test_only: skip train/val, only load test datasets
+    if args.test_only:
+        if not args.load_from:
+            raise ValueError("--test_only requires --load_from")
+
+        test_datasets = [
+            CacheDataSet(args, dataset_path=p,
+                         disable_pbar=not accelerator.is_main_process,
+                         type="test", preprocessor=preprocessor)
+            for p in args.test_dataset_path
+        ]
+        if accelerator.is_main_process:
+            print(f"test={[len(d) for d in test_datasets]}")
+
+        dl_kwargs = dict(num_workers=args.num_workers, pin_memory=True,
+                         collate_fn=collate_fn, prefetch_factor=args.prefetch_factor)
+        test_dataloaders = [DataLoader(d, batch_size=args.eval_batch_size, shuffle=False, drop_last=False, **dl_kwargs) for d in test_datasets]
+
+        net = IDM(model_name=args.model_name, output_dim=OUTPUT_DIM)
+        loss_fn = nn.SmoothL1Loss()
+        ckpt = torch.load(args.load_from, map_location='cpu')
+        net.load_state_dict(ckpt["model_state_dict"])
+        if accelerator.is_main_process:
+            print(f"Loaded checkpoint from {args.load_from}")
+
+        net = accelerator.prepare(net)
+        test_dataloaders = [accelerator.prepare(dl) for dl in test_dataloaders]
+
+        preprocessor.use_transform = False
+        for i, dl in enumerate(test_dataloaders):
+            eval(accelerator, net, dl, loss_fn, 0, mode=f'test{i}', save_dir=save_dir)
+        return
+
     dataset = CacheDataSet(args, dataset_path=args.dataset_path,
                            disable_pbar=not accelerator.is_main_process,
                            preprocessor=preprocessor)
@@ -217,20 +233,8 @@ def main(args):
     test_dataloaders = [DataLoader(d, batch_size=args.eval_batch_size, shuffle=False, drop_last=False, **dl_kwargs) for d in test_datasets]
 
     net = IDM(model_name=args.model_name, output_dim=OUTPUT_DIM)
-    optimizer = AdamW(net.parameters(), lr=args.learning_rate)
-
-    # Compute per-joint delta std from training set for normalised motion weighting
-    if accelerator.is_main_process:
-        print("Computing delta_std from training set...")
-    all_deltas = []
-    for ep_idx in range(len(dataset.rgb_frames)):
-        qpos = dataset.qpos_data[ep_idx]            # [T, 16]
-        all_deltas.append(qpos[1:] - qpos[:-1])    # [T-1, 16]
-    all_deltas = torch.cat(all_deltas, dim=0)       # [N, 16]
-    delta_std = all_deltas.std(dim=0).clamp(min=1e-4)  # [16]
-    if accelerator.is_main_process:
-        print(f"delta_std: {[f'{v:.4f}' for v in delta_std.tolist()]}")
-    loss_fn = nn.SmoothL1Loss()
+    optimizer = AdamW(net.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+    loss_fn = nn.SmoothL1Loss()  # Huber loss (same as paper)
 
     # Cosine LR with linear warmup
     if args.lr_scheduler == "cosine":
@@ -280,32 +284,11 @@ def main(args):
     for step in pbar:
         img_t, dep_t, img_next, dep_next, pos_t, pos_next = next(train_gen)
 
-        # Ground-truth: increment only, pos_{t+1} never enters the model
-        delta_label = pos_next - pos_t   # [B, 16]
+        # Model predicts pos_{t+1} (absolute position)
+        pos_pred = net(img_t, dep_t, img_next, dep_next, pos_t)
 
-        result = net(img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
-        if isinstance(result, tuple):
-            delta_pred, mask = result
-        else:
-            delta_pred, mask = result, None
-
-        # Normalise delta by per-joint std before computing motion magnitude.
-        # This makes arm joints and gripper joints contribute equally to the weight.
-        with torch.no_grad():
-            delta_std_dev = delta_std.to(delta_label.device)                             # [16]
-            delta_normed  = delta_label / delta_std_dev                                  # [B, 16]
-            motion_weight = delta_normed.abs().mean(dim=1, keepdim=True)                 # [B, 1]
-            motion_weight = (motion_weight / (motion_weight.mean() + 1e-8)).clamp(0.2, 5.0)
-
-        per_sample_loss = torch.nn.functional.smooth_l1_loss(delta_pred, delta_label, reduction='none').mean(dim=1, keepdim=True)
-        loss = (per_sample_loss * motion_weight).mean()
-        mask_loss = torch.tensor(0.0, device=loss.device)
-        if mask is not None:
-            # Bidirectional penalty: keep mask density near target (0.3)
-            # prevents both collapse-to-zero and spread-to-all
-            target_density = 0.3
-            mask_loss = args.mask_weight * (mask.mean() - target_density).pow(2)
-            loss = loss + mask_loss
+        # Huber loss: predict absolute pos_{t+1}
+        loss = loss_fn(pos_pred, pos_next)
 
         optimizer.zero_grad()
         accelerator.backward(loss)
@@ -315,14 +298,13 @@ def main(args):
             scheduler.step()
 
         if accelerator.is_main_process:
-            batch_acc = is_close(delta_label, delta_pred, delta_label.device).float().mean().item()
+            batch_acc = is_close(pos_next, pos_pred, pos_next.device).float().mean().item()
             lr_now = scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]["lr"]
-            pbar.set_postfix(loss=f"{loss.item():.2e}", mask=f"{mask_loss.item():.2e}",
+            pbar.set_postfix(loss=f"{loss.item():.2e}",
                              lr=f"{lr_now:.2e}", acc=f"{batch_acc:.3f}")
             if step % 10 == 0:
                 wandb.log({
                     "loss": loss.item(),
-                    "mask_loss": mask_loss.item(),
                     "learning_rate": lr_now,
                     "batch_accuracy": batch_acc,
                 }, step=step)
