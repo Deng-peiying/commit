@@ -107,6 +107,43 @@ def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='outp
         for img_t, dep_t, img_next, dep_next, pos_t, pos_next in tqdm(dataloader, disable=not accelerator.is_main_process):
             pos_pred = net(img_t, dep_t, img_next, dep_next, pos_t)
 
+            # --- Visualize mask on first batch ---
+            if first_batch and accelerator.is_main_process:
+                try:
+                    _, masks = accelerator.unwrap_model(net).model.forward(
+                        img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
+                    if isinstance(masks, tuple):
+                        mask_t_vis, mask_next_vis = masks
+                    else:
+                        mask_t_vis = masks
+                        mask_next_vis = None
+
+                    for tag, img_vis, mask_vis in [("t", img_t, mask_t_vis), ("next", img_next, mask_next_vis)]:
+                        if mask_vis is None:
+                            continue
+                        # Denormalize RGB
+                        rgb = img_vis[0].detach().cpu().numpy().transpose(1, 2, 0)
+                        rgb = rgb * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+
+                        m = mask_vis[0, 0].detach().cpu().numpy()
+                        m_uint8 = np.clip(m * 255, 0, 255).astype(np.uint8)
+
+                        # Mask overlay: green tint on masked region
+                        overlay = rgb.copy()
+                        overlay[m > 0.5, 1] = np.clip(overlay[m > 0.5, 1].astype(int) + 80, 0, 255).astype(np.uint8)
+
+                        # Save: mask alone + overlay
+                        cv2.imwrite(os.path.join(save_dir, f'mask_{tag}_{mode}_{step}.png'), m_uint8)
+                        cv2.imwrite(os.path.join(save_dir, f'mask_overlay_{tag}_{mode}_{step}.png'), overlay[:, :, ::-1])
+
+                    # Log mask stats
+                    mask_mean = mask_t_vis[0].mean().item()
+                    mask_ratio = (mask_t_vis[0] > 0.5).float().mean().item()
+                    print(f"  mask stats: mean={mask_mean:.4f}, ratio(>0.5)={mask_ratio:.2%}")
+                except Exception as e:
+                    print(f"  [mask vis skipped: {e}]")
+
             pos_next_g = accelerator.gather(pos_next)
             pos_pred_g = accelerator.gather(pos_pred)
             pos_t_g    = accelerator.gather(pos_t)

@@ -40,11 +40,11 @@ def down(in_channels,out_channels):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels, base_channel=64):
+    def __init__(self, in_channels, out_channels, base_channel=64, num_layers=5):
         super(UNet, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.num_layers = 5
+        self.num_layers = num_layers
         self.in_conv = doubleConv(self.in_channels, base_channel)
         self.downs = [None] * self.num_layers
         self.ups = [None] * self.num_layers
