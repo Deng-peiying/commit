@@ -61,7 +61,8 @@ class MaskedIDM(nn.Module):
 
         # Shared mask generator: 3ch single-frame → soft foreground mask
         # Forward twice (once per frame) with shared weights.
-        self.mask_net = UNet(in_channels=3, out_channels=1)
+        # 3 layers is sufficient for foreground segmentation, saves ~65M params.
+        self.mask_net = UNet(in_channels=3, out_channels=1, base_channel=64, num_layers=3)
 
         # Shared RGB encoder: 3ch masked single-frame → FEAT_DIM
         self.rgb_encoder = ResNet(output_dim=FEAT_DIM, input_channels=3, resnet_type='34')
@@ -120,11 +121,13 @@ class MaskedIDM(nn.Module):
         # --- State embedding ---
         feat_state = self.state_mlp(pos_t)         # [B, STATE_EMBED_DIM]
 
-        # --- Predict pos_{t+1} ---
-        # feat_dep_t = global 3D spatial prior
-        # dep_diff   = geometric motion
+        # --- Predict pos_{t+1} via residual: pos_t + delta ---
+        # pos_t participates as feature (helps head understand current state),
+        # but pos_t in the residual addition is detached to prevent the network
+        # from short-circuiting (learning identity instead of delta).
         fused = torch.cat([rgb_diff, feat_dep_t, dep_diff, feat_state], dim=-1)
-        out   = self.head(fused)                   # [B, output_dim]
+        delta = self.head(fused)                   # [B, output_dim]
+        out   = pos_t.detach() + delta             # residual; detach prevents shortcut
 
         if return_mask:
             return out, (mask_t, mask_next)
