@@ -200,7 +200,7 @@ def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='outp
 
 def main(args):
     seed_torch(1234)
-    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)])
+    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
     num_gpus = max(torch.cuda.device_count(), 1)
     save_dir = os.path.join(args.save_dir, args.run_name)
 
@@ -319,8 +319,17 @@ def main(args):
     net.train()
     train_gen = get_data_generator(train_dataloader)
 
+    mask_frozen = False
     pbar = tqdm(range(start_step, args.num_iterations), disable=not accelerator.is_main_process)
     for step in pbar:
+        # Freeze UNet after specified step to prevent mask degradation
+        if not mask_frozen and args.freeze_mask_after >= 0 and step >= args.freeze_mask_after:
+            for p in accelerator.unwrap_model(net).model.mask_net.parameters():
+                p.requires_grad = False
+            mask_frozen = True
+            if accelerator.is_main_process:
+                print(f"\n[Step {step}] UNet mask_net frozen.")
+
         img_t, dep_t, img_next, dep_next, pos_t, pos_next = next(train_gen)
 
         # Model predicts pos_{t+1} (absolute position)
