@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--test_dataset_path", nargs="+", default=[])
     parser.add_argument("--eval_only", action="store_true", default=False)
     parser.add_argument("--test_only", action="store_true", default=False, help="Only run test eval, skip train/val loading")
+    parser.add_argument("--freeze_mask_after", type=int, default=-1,
+                        help="Freeze UNet mask_net after this many steps. -1 = never freeze.")
     return parser.parse_args()
 
 
@@ -198,7 +200,7 @@ def eval(accelerator, net, dataloader, loss_fn, step, mode='val', save_dir='outp
 
 def main(args):
     seed_torch(1234)
-    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
+    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)])
     num_gpus = max(torch.cuda.device_count(), 1)
     save_dir = os.path.join(args.save_dir, args.run_name)
 
