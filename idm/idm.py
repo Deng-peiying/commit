@@ -27,30 +27,25 @@ class IDM(nn.Module):
 
 
 class MaskedIDM(nn.Module):
-    """Masked dual-frame IDM (shared-encoder, per-frame mask).
+    """Masked dual-frame IDM (concat, no explicit diff).
 
     Architecture:
-        1. Shared UNet(3ch) generates per-frame soft masks:
-             mask_t    = sigmoid(UNet(img_t))       → [B,1,H,W]
-             mask_next = sigmoid(UNet(img_next))    → [B,1,H,W]
-           Each mask precisely covers the arm position in its own frame.
+        1. Shared UNet(3ch, 3 layers) generates per-frame hard masks:
+             mask_t    = hard(sigmoid(UNet(img_t)))    → [B,1,H,W]
+             mask_next = hard(sigmoid(UNet(img_next))) → [B,1,H,W]
 
-        2. Shared RGB encoder + feature-level diff (RGB motion):
-             feat_rgb_t    = RGB_enc(mask_t    * img_t)    → [B, FEAT_DIM]
-             feat_rgb_next = RGB_enc(mask_next * img_next) → [B, FEAT_DIM]
-             rgb_diff = feat_rgb_next - feat_rgb_t         → [B, FEAT_DIM]
-           Masked RGB focuses on arm region; diff extracts semantic motion.
+        2. RGB encoder: concat masked frames → single forward
+             feat_rgb = RGB_enc(cat[mask_t*img_t, mask_next*img_next])  → [B, FEAT_DIM]
+           Network implicitly learns motion from 6ch concat (no explicit diff).
+           Mask filters background; encoder focuses on arm region changes.
 
-        3. Shared Depth encoder (global, no mask):
-             feat_dep_t    = Dep_enc(dep_t)    → [B, DEP_DIM]
-             feat_dep_next = Dep_enc(dep_next) → [B, DEP_DIM]
-           - feat_dep_t doubles as global 3D spatial prior.
-           - dep_diff = feat_dep_next - feat_dep_t → geometric motion.
-           No mask: depth diff is naturally sparse; full scene geometry preserved.
+        3. Depth encoder: concat both depth frames → single forward
+             feat_dep = Dep_enc(cat[dep_t, dep_next])  → [B, DEP_DIM]
+           No mask. Contains both spatial prior (from dep_t) and geometric motion.
 
         4. State encoder: MLP(pos_t) → [B, STATE_EMBED_DIM]
 
-        5. Head(cat[rgb_diff, feat_dep_prior, dep_diff, feat_state]) → pos_{t+1}
+        5. Head(cat[feat_rgb, feat_dep, feat_state]) → pos_{t+1}
     """
 
     DEP_DIM = 256
@@ -59,17 +54,15 @@ class MaskedIDM(nn.Module):
         super().__init__()
         self.output_dim = output_dim
 
-        # Shared mask generator: 3ch single-frame → soft foreground mask
+        # Shared mask generator: 3ch single-frame → hard foreground mask
         # Forward twice (once per frame) with shared weights.
-        # 3 layers is sufficient for foreground segmentation, saves ~65M params.
         self.mask_net = UNet(in_channels=3, out_channels=1, base_channel=64, num_layers=3)
 
-        # Shared RGB encoder: 3ch masked single-frame → FEAT_DIM
-        self.rgb_encoder = ResNet(output_dim=FEAT_DIM, input_channels=3, resnet_type='34')
+        # RGB encoder: 6ch (masked img_t + masked img_next) → FEAT_DIM
+        self.rgb_encoder = ResNet(output_dim=FEAT_DIM, input_channels=6, resnet_type='34')
 
-        # Shared Depth encoder: 1ch global depth → DEP_DIM
-        # Used for both spatial prior (dep_t) and motion (dep_diff).
-        self.dep_encoder = ResNet(output_dim=self.DEP_DIM, input_channels=1, resnet_type='34')
+        # Depth encoder: 2ch (dep_t + dep_next) → DEP_DIM
+        self.dep_encoder = ResNet(output_dim=self.DEP_DIM, input_channels=2, resnet_type='34')
 
         # State encoder: pos_t → STATE_EMBED_DIM
         self.state_mlp = nn.Sequential(
@@ -80,8 +73,8 @@ class MaskedIDM(nn.Module):
         )
 
         # Head: fused features → pos_{t+1}
-        # rgb_diff(512) + dep_prior(256) + dep_diff(256) + state(128) = 1152
-        head_in = FEAT_DIM + self.DEP_DIM + self.DEP_DIM + STATE_EMBED_DIM
+        # feat_rgb(512) + feat_dep(256) + state(128) = 896
+        head_in = FEAT_DIM + self.DEP_DIM + STATE_EMBED_DIM
         self.head = nn.Sequential(
             nn.Linear(head_in, 512),
             nn.ReLU(inplace=True),
@@ -91,7 +84,7 @@ class MaskedIDM(nn.Module):
         )
 
         total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"MaskedIDM (shared-enc, per-frame mask) — output_dim={output_dim}, "
+        print(f"MaskedIDM (concat, no diff) — output_dim={output_dim}, "
               f"feat_rgb={FEAT_DIM}, dep={self.DEP_DIM}, state={STATE_EMBED_DIM}, "
               f"params={total:,}")
 
@@ -102,32 +95,25 @@ class MaskedIDM(nn.Module):
             dep_next = dep_next.unsqueeze(1)
 
         # --- Per-frame hard mask (shared UNet, forward twice) ---
-        # Straight-through estimator: hard 0/1 in forward, gradient flows through sigmoid in backward.
         soft_t    = torch.sigmoid(self.mask_net(img_t))      # [B, 1, H, W]
         soft_next = torch.sigmoid(self.mask_net(img_next))   # [B, 1, H, W]
-        mask_t    = ((soft_t    > 0.5).float() - soft_t).detach() + soft_t     # hard 0/1
+        mask_t    = ((soft_t    > 0.5).float() - soft_t).detach() + soft_t
         mask_next = ((soft_next > 0.5).float() - soft_next).detach() + soft_next
 
-        # --- RGB motion: shared encoder on masked frames, then diff ---
-        feat_rgb_t    = self.rgb_encoder(mask_t    * img_t)    # [B, FEAT_DIM]
-        feat_rgb_next = self.rgb_encoder(mask_next * img_next) # [B, FEAT_DIM]
-        rgb_diff      = feat_rgb_next - feat_rgb_t             # [B, FEAT_DIM]
+        # --- RGB: concat masked frames, single forward ---
+        rgb_cat  = torch.cat([mask_t * img_t, mask_next * img_next], dim=1)  # [B, 6, H, W]
+        feat_rgb = self.rgb_encoder(rgb_cat)                                  # [B, FEAT_DIM]
 
-        # --- Depth: shared encoder, no mask ---
-        feat_dep_t    = self.dep_encoder(dep_t)    # [B, DEP_DIM]  (also serves as spatial prior)
-        feat_dep_next = self.dep_encoder(dep_next) # [B, DEP_DIM]
-        dep_diff      = feat_dep_next - feat_dep_t # [B, DEP_DIM]  geometric motion
+        # --- Depth: concat both frames, single forward, no mask ---
+        dep_cat  = torch.cat([dep_t, dep_next], dim=1)  # [B, 2, H, W]
+        feat_dep = self.dep_encoder(dep_cat)             # [B, DEP_DIM]
 
         # --- State embedding ---
-        feat_state = self.state_mlp(pos_t)         # [B, STATE_EMBED_DIM]
+        feat_state = self.state_mlp(pos_t)               # [B, STATE_EMBED_DIM]
 
-        # --- Predict pos_{t+1} via residual: pos_t + delta ---
-        # pos_t participates as feature (helps head understand current state),
-        # but pos_t in the residual addition is detached to prevent the network
-        # from short-circuiting (learning identity instead of delta).
-        fused = torch.cat([rgb_diff, feat_dep_t, dep_diff, feat_state], dim=-1)
-        delta = self.head(fused)                   # [B, output_dim]
-        out   = pos_t.detach() + delta             # residual; detach prevents shortcut
+        # --- Predict pos_{t+1} directly ---
+        fused = torch.cat([feat_rgb, feat_dep, feat_state], dim=-1)
+        out   = self.head(fused)                          # [B, output_dim]
 
         if return_mask:
             return out, (mask_t, mask_next)
