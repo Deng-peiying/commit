@@ -321,11 +321,18 @@ def main(args):
     for step in pbar:
         img_t, dep_t, img_next, dep_next, pos_t, pos_next = next(train_gen)
 
-        # Model predicts pos_{t+1} (absolute position)
-        pos_pred = net(img_t, dep_t, img_next, dep_next, pos_t)
+        # Model predicts pos_{t+1} (absolute position) + masks
+        pos_pred, (mask_t, mask_next) = accelerator.unwrap_model(net).model.forward(
+            img_t, dep_t, img_next, dep_next, pos_t, return_mask=True)
 
         # Huber loss: predict absolute pos_{t+1}
-        loss = loss_fn(pos_pred, pos_next)
+        action_loss = loss_fn(pos_pred, pos_next)
+
+        # L1 sparsity regularization on mask (ViDAR paper: λ = 3e-3)
+        # Penalizes white pixels → encourages mask to only keep useful regions (arm).
+        # When arm is absent, mask naturally goes all-black (no useful pixels to keep).
+        mask_sparsity = mask_t.mean() + mask_next.mean()
+        loss = action_loss + 3e-3 * mask_sparsity
 
         optimizer.zero_grad()
         accelerator.backward(loss)
