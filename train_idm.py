@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--test_dataset_path", nargs="+", default=[])
     parser.add_argument("--eval_only", action="store_true", default=False)
     parser.add_argument("--test_only", action="store_true", default=False, help="Only run test eval, skip train/val loading")
+    parser.add_argument("--freeze_mask_after", type=int, default=-1,
+                        help="Freeze UNet mask_net after this many steps. -1 = never freeze.")
     return parser.parse_args()
 
 
@@ -317,8 +319,17 @@ def main(args):
     net.train()
     train_gen = get_data_generator(train_dataloader)
 
+    mask_frozen = False
     pbar = tqdm(range(start_step, args.num_iterations), disable=not accelerator.is_main_process)
     for step in pbar:
+        # Freeze UNet after specified step to prevent mask degradation
+        if not mask_frozen and args.freeze_mask_after >= 0 and step >= args.freeze_mask_after:
+            for p in accelerator.unwrap_model(net).model.mask_net.parameters():
+                p.requires_grad = False
+            mask_frozen = True
+            if accelerator.is_main_process:
+                print(f"\n[Step {step}] UNet mask_net frozen.")
+
         img_t, dep_t, img_next, dep_next, pos_t, pos_next = next(train_gen)
 
         # Model predicts pos_{t+1} (absolute position)
