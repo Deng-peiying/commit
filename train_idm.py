@@ -328,11 +328,12 @@ def main(args):
         # Huber loss: predict absolute pos_{t+1}
         action_loss = loss_fn(pos_pred, pos_next)
 
-        # L1 sparsity regularization on mask (ViDAR paper: λ = 3e-3)
+        # L1 sparsity regularization on mask
         # Penalizes white pixels → encourages mask to only keep useful regions (arm).
         # When arm is absent, mask naturally goes all-black (no useful pixels to keep).
+        # λ=1e-4: gentle enough to let mask learn before being pushed sparse.
         mask_sparsity = mask_t.mean() + mask_next.mean()
-        loss = action_loss + 3e-3 * mask_sparsity
+        loss = action_loss + 1e-4 * mask_sparsity
 
         optimizer.zero_grad()
         accelerator.backward(loss)
